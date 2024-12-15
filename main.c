@@ -10,10 +10,13 @@
 #include <dirent.h>
 #include <time.h>
 
-#define MAX_GOODS  700
+#define MAX_GOODS 700
 #define MAX_SHOPS 3
 #define LOG_FILE "logfile.log"
 #define RESULT_FILE "results.txt"
+#define PIPE_MSG_SIZE 256
+#define MAX_NAME_LENGTH 20
+#define MAX_LINE_LENGTH 256
 
 // Structure for goods
 typedef struct {
@@ -25,15 +28,7 @@ typedef struct {
     float score; // score = price * point
 } Good;
 
-// Structure for shop
-typedef struct {
-    char shop_name[20];
-    Good goods[MAX_GOODS];
-    int good_count;
-    float point;
-} Shop;
-
-// Structure client
+// Structure for client
 typedef struct {
     char user_name[20]; //client name
     int price_treshold;
@@ -42,6 +37,17 @@ typedef struct {
     char shopped_shops[MAX_SHOPS][20]; // Track shops the client has shopped from
     int shop_count;
 } Client;
+
+
+
+// Structure for shop
+
+typedef struct {
+    char shop_name[20];
+    Good goods[MAX_GOODS];
+    int good_count;
+    float point;
+} Shop;
 
 // Mutex for logging
 pthread_mutex_t log_mutex;
@@ -65,41 +71,76 @@ void log_activity(const char *message) {
 }
 
 // Function to read good data from file
+// Function to read good data from file
 void read_good_data(const char *filename, Good *good) {
     FILE *file = fopen(filename, "r");
     if (file == NULL) {
         perror("Error opening good file");
         return;
     }
-    fscanf(file, "%s %d %f %d %s", good->name, &good->price, &good->point, &good->entity, good->last_modified);
+
+    char line[256];
+
+    while (fgets(line, sizeof(line), file)) {
+        if (strncmp(line, "Name:", 5) == 0) {
+            sscanf(line, "Name: %s", good->name);
+        } else if (strncmp(line, "Price:", 6) == 0) {
+            sscanf(line, "Price: %d", &good->price);
+        } else if (strncmp(line, "Score:", 6) == 0) {
+            sscanf(line, "Score: %f", &good->point);
+        } else if (strncmp(line, "Entity:", 7) == 0) {
+            sscanf(line, "Entity: %d", &good->entity);
+        } else if (strncmp(line, "Last Modified:", 14) == 0) {
+            sscanf(line, "Last Modified: %s", good->last_modified);
+        }
+    }
+
     fclose(file);
     good->score = good->price * good->point; // Calculate score
 }
 
+
 // Thread function for processing goods
 void *process_good(void *arg) {
     Good *good = (Good *)arg;
+    Client *client = good->client; // Assume good has a reference to the client
+
     char log_message[100];
-    snprintf(log_message, sizeof(log_message), "Processed good %s with price %d", good->name, good->price);
+
+    // Check if the amount of good required is available
+    for (int i = 0; i < client->shopping_count; i++) {
+        if (strcmp(client->shopping_list[i].name, good->name) == 0) {
+            if (client->shopping_list[i].entity <= good->entity) {
+                int total_price = client->shopping_list[i].entity * good->price;
+                snprintf(log_message, sizeof(log_message), "Processed good %s with price %d for amount %d",
+                         good->name, total_price, client->shopping_list[i].entity);
+                log_activity(log_message);
+                sleep(1); // Simulate processing time
+                sem_post(&sem); // Signal that processing is done
+                return NULL;
+            } else {
+                snprintf(log_message, sizeof(log_message), "Not enough entity for good %s. Required: %d, Available: %d",
+                         good->name, client->shopping_list[i].entity, good->entity);
+                log_activity(log_message);
+            }
+        }
+    }
+
+    snprintf(log_message, sizeof(log_message), "Good %s not in client's shopping list", good->name);
     log_activity(log_message);
-    sleep(1); // Simulate processing time
     sem_post(&sem); // Signal that processing is done
     return NULL;
 }
 
-// Function for processing a shop and writing results to file
-void process_shop(const char *shop_name, int client_budget, int pipe_fd) {
-    char log_message[100];
-    snprintf(log_message, sizeof(log_message), "Accessed Store %s", shop_name);
-    log_activity(log_message);
-
+// Function for processing a category and writing results to file
+void process_category(const char *category_path, Client *client, int pipe_fd) {
     DIR *d;
     struct dirent *dir;
-    d = opendir(shop_name);
-    if (d == NULL)
-    {
-        perror("Error opening shop directory");
-        snprintf(log_message, sizeof(log_message), "Error opening shop directory: %s", shop_name);
+    d = opendir(category_path);
+    if (d == NULL) {
+        perror("Error opening category directory");
+        char log_message[100];
+        snprintf(log_message, sizeof(log_message), "Error opening category directory: %s", category_path);
         log_activity(log_message);
         return;
     }
@@ -107,34 +148,22 @@ void process_shop(const char *shop_name, int client_budget, int pipe_fd) {
     pthread_t threads[MAX_GOODS];
     int good_count = 0;
 
-    // Open result file for appending
-    FILE *result_file = fopen(RESULT_FILE, "a");
-    if (result_file == NULL) {
-        perror("Error opening result file");
-        return;
-    }
-
-    fprintf(result_file, "Shop: %s\n", shop_name);
-
     Good best_good;
     best_good.score = 0;
 
     while ((dir = readdir(d)) != NULL) {
-        if (dir->d_type == DT_REG) { // If it's a regular file
+        if (dir->d_type == DT_REG && strstr(dir->d_name, ".txt")) { // If it's a regular file and a .txt file
             Good good;
-            char filepath[100];
-            snprintf(filepath, sizeof(filepath), "%s/%s", shop_name, dir->d_name);
+            char filepath[256];
+            snprintf(filepath, sizeof(filepath), "%s/%s", category_path, dir->d_name);
             read_good_data(filepath, &good);
-            if (good.price <= client_budget) {
-                pthread_create(&threads[good_count], NULL, process_good, &good);
-                fprintf(result_file, "Good: %s, Price: %d, Point: %.2f, Entity: %d, Last Modified: %s, Score: %.2f\n",
-                        good.name, good.price, good.point, good.entity, good.last_modified, good.score);
-                sem_wait(&sem); // Wait for the thread to signal completion
-                if (good.score > best_good.score) {
-                    best_good = good;
-                }
-                good_count++;
+            // good.client = client; // Set the client reference
+            pthread_create(&threads[good_count], NULL, process_good, &good);
+            sem_wait(&sem); // Wait for the thread to signal completion
+            if (good.score > best_good.score) {
+                best_good = good;
             }
+            good_count++;
         }
     }
 
@@ -142,19 +171,67 @@ void process_shop(const char *shop_name, int client_budget, int pipe_fd) {
         pthread_join(threads[i], NULL);
     }
 
-    // Show the best good to the client
-    printf("Best Good in Shop %s: %s, Price: %d, Point: %.2f, Score: %.2f\n",
-            shop_name, best_good.name, best_good.price, best_good.point, best_good.score);
+    if (good_count > 0) {
+        // Log best good
+        char log_message[256];
+        snprintf(log_message, sizeof(log_message), "Best Good in Category %s: %s, Price: %d, Point: %.2f, Score: %.2f",
+                 category_path, best_good.name, best_good.price, best_good.point, best_good.score);
+        log_activity(log_message);
 
-    fprintf(result_file, "Best Good: %s, Price: %d, Point: %.2f, Score: %.2f\n",
-            best_good.name, best_good.price, best_good.point, best_good.score);
-    fprintf(result_file, "-----------------------------\n");
-    fclose(result_file);
+        // Show the best good to the client
+        printf("Best Good in Category %s: %s, Price: %d, Point: %.2f, Score: %.2f\n",
+               category_path, best_good.name, best_good.price, best_good.point, best_good.score);
+
+        // Send message to parent process
+        char pipe_msg[PIPE_MSG_SIZE];
+        snprintf(pipe_msg, sizeof(pipe_msg), "Best Good in %s: %s, Price: %d, Point: %.2f, Score: %.2f",
+                 category_path, best_good.name, best_good.price, best_good.point, best_good.score);
+        write(pipe_fd, pipe_msg, strlen(pipe_msg) + 1);
+    }
+
     closedir(d);
+    // Notify parent process that category processing is complete
+    write(pipe_fd, "done", 4);
+}
 
+// Function for processing a shop and writing results to file
+void process_shop(const char *shop_name, Client *client, int pipe_fd) {
+    char log_message[100];
+    snprintf(log_message, sizeof(log_message), "Accessed Store %s", shop_name);
+    log_activity(log_message);
+
+    DIR *d;
+    struct dirent *dir;
+    d = opendir(shop_name);
+    if (d == NULL) {
+        perror("Error opening shop directory");
+        snprintf(log_message, sizeof(log_message), "Error opening shop directory: %s", shop_name);
+        log_activity(log_message);
+        return;
+    }
+
+    while ((dir = readdir(d)) != NULL) {
+        if (dir->d_type == DT_DIR && strcmp(dir->d_name, ".") != 0 && strcmp(dir->d_name, "..") != 0) {
+            // If it's a directory and not "." or ".."
+            char category_path[256];
+            snprintf(category_path, sizeof(category_path), "%s/%s", shop_name, dir->d_name);
+            pid_t category_pid = fork();
+            if (category_pid == 0) {
+                // Child process for category
+                process_category(category_path, client, pipe_fd);
+                exit(0);
+            }
+        }
+    }
+
+    // Wait for all category processes to finish
+    while (wait(NULL) > 0);
+
+    closedir(d);
     // Notify parent process that shop processing is complete
     write(pipe_fd, "done", 4);
 }
+
 
 // Function to check if the client has shopped from the shop before
 int has_shopped_before(Client *client, const char *shop_name) {
@@ -190,20 +267,58 @@ void *update_goods_amount(void *arg) {
     return NULL;
 }
 
-// Main function
+// Function to get client data from terminal input
+void get_client_data(Client *client) {
+    char line[MAX_LINE_LENGTH];
+    client->shopping_count = 0;
+    client->price_treshold = -1; // No price threshold by default
+
+    printf("Enter user name: ");
+    fgets(client->user_name, sizeof(client->user_name), stdin);
+    client->user_name[strcspn(client->user_name, "\n")] = 0; // Remove newline character
+
+    printf("Enter shopping list (format: item price) and type 'end' to finish:\n");
+    while (1) {
+        printf("Item %d: ", client->shopping_count + 1);
+        fgets(line, sizeof(line), stdin);
+        line[strcspn(line, "\n")] = 0; // Remove newline character
+        if (strcmp(line, "end") == 0) {
+            break;
+        }
+        sscanf(line, "%s %d", client->shopping_list[client->shopping_count].name, &client->shopping_list[client->shopping_count].price);
+        client->shopping_list[client->shopping_count].point = 0; // Default point
+        client->shopping_list[client->shopping_count].entity = 0; // Default entity
+        client->shopping_count++;
+    }
+
+    printf("Enter price threshold (or press Enter to skip): ");
+    fgets(line, sizeof(line), stdin);
+    line[strcspn(line, "\n")] = 0; // Remove newline character
+    if (strlen(line) > 0) {
+        client->price_treshold = atoi(line);
+    }
+}
+
 int main() {
     // Initialize mutex and semaphore
     pthread_mutex_init(&log_mutex, NULL);
     sem_init(&sem, 0, 0);
 
-    // Example client data
-    Client client = {"John", 650, { {"lamp", 100}, {"computer", 450}, {"shower", 100} }, 3};
-    client.shop_count = 0;
+    // Get client data from user input
+    Client client;
+    get_client_data(&client);
 
     // Create a process for the client
+    int main_pipe[2];
+    if (pipe(main_pipe) == -1) {
+        perror("pipe");
+        exit(1);
+    }
+
     pid_t client_pid = fork();
     if (client_pid == 0) {
         // Child process for client
+        close(main_pipe[0]); // Close reading end in child
 
         // Get shop directories
         char *shops[] = {"Store1", "Store2", "Store3"};
@@ -235,29 +350,17 @@ int main() {
         }
 
         // Wait for all shop processes to finish and read from pipes
-        char buffer[4];
-        for (int i = 0; i < shop_count; i++) {
-            read(pipes[i][0], buffer, 4);
-            close(pipes[i][0]);
-
-            // Add shop to client's shopped shops
-            strncpy(client.shopped_shops[client.shop_count++], shops[i], sizeof(client.shopped_shops[0]) - 1);
+        char buffer[PIPE_MSG_SIZE];
+        while (read(main_pipe[0], buffer, PIPE_MSG_SIZE) > 0) {
+            printf("Message from shop: %s\n", buffer);
         }
 
-        // Create threads for client processing
-        pthread_t price_thread, update_thread;
-        pthread_create(&price_thread, NULL, calculate_total_price, &client);
-        pthread_create(&update_thread, NULL, update_goods_amount, NULL);
-
-        // Wait for threads to finish
-        pthread_join(price_thread, NULL);
-        pthread_join(update_thread, NULL);
-
-        // Wait for all shop processes to finish
-        while (wait(NULL) > 0);
+        close(main_pipe[0]);
         exit(0);
     }
+
     // Wait for the client process to finish
+    close(main_pipe[1]); // Close writing end in parent
     while (wait(NULL) > 0);
 
     // Destroy mutex and semaphore
